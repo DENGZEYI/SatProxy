@@ -26,6 +26,7 @@ type Keypair struct {
 	send         cipher.AEAD
 	receive      cipher.AEAD
 	replayFilter replay.Filter
+	lostChecker  replay.Checker // 检查丢包
 	isInitiator  bool
 	created      time.Time
 	localIndex   uint32

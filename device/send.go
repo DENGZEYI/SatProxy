@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -443,7 +442,7 @@ func calculatePaddingSize(packetSize, mtu int) int {
  */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
-	var nonce [chacha20poly1305.NonceSize]byte
+	//var nonce [chacha20poly1305.NonceSize]byte
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
@@ -467,13 +466,15 @@ func (device *Device) RoutineEncryption(id int) {
 
 			// encrypt content and release to consumer
 
-			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			elem.packet = elem.keypair.send.Seal(
-				header,
-				nonce[:],
-				elem.packet,
-				nil,
-			)
+			// 跳过加密
+			// binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
+			// elem.packet = elem.keypair.send.Seal(
+			// 	header,
+			// 	nonce[:],
+			// 	elem.packet,
+			// 	nil,
+			// )
+			elem.packet = append(header, elem.packet...)
 		}
 		elemsContainer.Unlock()
 	}
@@ -515,17 +516,24 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 				dataSent = true
 			}
 			bufs = append(bufs, elem.packet)
+			/*satVPN*/
+			// 重传是针对peer的，因为counter是每个peer独立计算的
+			overWriteBuffer := elem.peer.pktBuffer.Write(elem.packet, elem.nonce, elem.buffer)
+			if overWriteBuffer != nil {
+				device.PutMessageBuffer(overWriteBuffer) // 重写buffer回收 // TODO 在ring buffer的read中也需要删除
+			}
 		}
 
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
 
 		err := peer.SendBuffers(bufs)
+
 		if dataSent {
 			peer.timersDataSent()
 		}
 		for _, elem := range elemsContainer.elems {
-			device.PutMessageBuffer(elem.buffer)
+			//device.PutMessageBuffer(elem.buffer) //自己重写buffer回收
 			device.PutOutboundElement(elem)
 		}
 		device.PutOutboundElementsContainer(elemsContainer)
@@ -542,5 +550,37 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		}
 
 		peer.keepKeyFreshSending()
+	}
+}
+
+func (peer *Peer) RoutineSequentialRetransmiter(maxBatchSize int) {
+	device := peer.device
+	defer func() {
+		defer device.log.Verbosef("%v - Routine: sequential Retransmiter - stopped", peer)
+		peer.stopping.Done()
+	}()
+	device.log.Verbosef("%v - Routine: sequential Retransmiter - started", peer)
+
+	for rr_counter := range peer.rr_queue {
+		if rr_counter == 1 {
+			device.log.Errorf("hitRate: %.4f - hitNum: %.4f - missNum: %.4f", peer.pktBuffer.hitRate, peer.pktBuffer.hitNum, peer.pktBuffer.missNum)
+			return
+		}
+		pkt := peer.pktBuffer.findLostPkt(uint64(rr_counter))
+		if pkt == nil {
+			peer.pktBuffer.missNum++
+		} else {
+			// 重传丢掉的包
+			err := peer.SendBuffers([][]byte{pkt})
+			//peer.device.log.Errorf("%v - 重传: %v", peer, rr_counter)
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to retransmit packet: %v", peer, err)
+			}
+			peer.pktBuffer.hitNum++
+		}
+		peer.pktBuffer.hitRate = float64(peer.pktBuffer.hitNum) / float64(peer.pktBuffer.hitNum+peer.pktBuffer.missNum)
+		// if int(peer.pktBuffer.hitNum+peer.pktBuffer.missNum)%100 == 0 {
+		// 	device.log.Errorf("hitRate: %.4f - hitNum: %.4f - missNum: %.4f", peer.pktBuffer.hitRate, peer.pktBuffer.hitNum, peer.pktBuffer.missNum)
+		// }
 	}
 }

@@ -14,6 +14,8 @@ const (
 	QueueOutboundSize          = 1024
 	QueueInboundSize           = 1024
 	QueueHandshakeSize         = 1024
+	RRQueueSize                = 1024
+	RingBufferSize             = 3000
 	MaxSegmentSize             = (1 << 16) - 1 // largest possible UDP datagram
 	PreallocatedBuffersPerPool = 0             // Disable and allow for infinite memory growth
 )

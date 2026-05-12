@@ -53,26 +53,30 @@ const (
 )
 
 const (
-	MessageInitiationType  = 1
-	MessageResponseType    = 2
-	MessageCookieReplyType = 3
-	MessageTransportType   = 4
+	MessageInitiationType            uint32 = 1
+	MessageResponseType              uint32 = 2
+	MessageCookieReplyType           uint32 = 3
+	MessageTransportType             uint32 = 4
+	MessageRetransmissionRequestType uint32 = 5
 )
 
 const (
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageResponseSize        = 92                                            // size of response message
-	MessageCookieReplySize     = 64                                            // size of cookie reply message
-	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
-	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
-	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
+	MessageInitiationSize            = 148                                           // size of handshake initiation message
+	MessageResponseSize              = 92                                            // size of response message
+	MessageCookieReplySize           = 64                                            // size of cookie reply message
+	MessageTransportHeaderSize       = 16                                            // size of data preceding content in transport message
+	MessageRetransmissionRequestSize = 64                                            // 重传请求消息大小
+	MessageTransportSize             = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
+	MessageKeepaliveSize             = MessageTransportSize                          // size of keepalive
+	MessageHandshakeSize             = MessageInitiationSize                         // size of largest handshake related message
 )
 
 const (
-	MessageTransportOffsetReceiver = 4
-	MessageTransportOffsetCounter  = 8
-	MessageTransportOffsetContent  = 16
+	MessageTransportOffsetReceiver             = 4
+	MessageTransportOffsetCounter              = 8
+	MessageTransportOffsetContent              = 16
+	MessageRetransmissionRequestOffsetReceiver = 4
+	MessageRetransmissionRequestOffsetCounter  = 8
 )
 
 /* Type is an 8-bit field, followed by 3 nul bytes,
@@ -106,6 +110,14 @@ type MessageTransport struct {
 	Receiver uint32
 	Counter  uint64
 	Content  []byte
+}
+
+// 重传请求，请求对方重传某个消息。重传响应复用MessageTransport。
+type MessageRetransmissionRequest struct {
+	Type     uint32
+	Receiver uint32
+	Counter  uint64
+	Padding  [48]byte // padding, TODO:不知道为什么没有padding的话，RoutineReceiveIncoming接收不到重传请求
 }
 
 type MessageCookieReply struct {

@@ -53,6 +53,10 @@ type Peer struct {
 		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
 	}
 
+	rr_queue              chan uint32 // 重传队列
+	rr_notification_queue chan uint64 // 重传通知队列
+	pktBuffer             *RingBuffer
+
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
@@ -83,6 +87,11 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	peer.queue.outbound = newAutodrainingOutboundQueue(device)
 	peer.queue.inbound = newAutodrainingInboundQueue(device)
 	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
+
+	// for satellite
+	peer.rr_queue = make(chan uint32, RRQueueSize)
+	peer.rr_notification_queue = make(chan uint64, RRQueueSize)
+	peer.pktBuffer = NewRingBuffer(RingBufferSize) // TODO：内存泄漏
 
 	// map public key
 	_, ok := device.peers.keyMap[pk]
@@ -190,6 +199,7 @@ func (peer *Peer) Start() {
 	// reset routine state
 	peer.stopping.Wait()
 	peer.stopping.Add(2)
+	peer.stopping.Add(2) // 我自己新建了两个routine
 
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
@@ -207,6 +217,8 @@ func (peer *Peer) Start() {
 	batchSize := peer.device.BatchSize()
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
+	go peer.RoutineSequentialRetransmiter(batchSize)
+	go peer.RoutineSequentialNotifier(batchSize)
 
 	peer.isRunning.Store(true)
 }
@@ -270,6 +282,11 @@ func (peer *Peer) Stop() {
 	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
 	peer.queue.inbound.c <- nil
 	peer.queue.outbound.c <- nil
+	close(peer.rr_notification_queue)
+	close(peer.rr_queue)
+	//peer.rr_notification_queue <- 1
+	//peer.rr_queue <- 1
+
 	peer.stopping.Wait()
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
@@ -293,4 +310,131 @@ func (peer *Peer) markEndpointSrcForClearing() {
 		return
 	}
 	peer.endpoint.clearSrcOnTx = true
+}
+
+// RingBuffer 结构体定义
+type RingBuffer struct {
+	cache_pkt    [][]byte // pkt cache
+	cache_nonce  []uint64 // nonce cache
+	cache_buffer []*[MaxMessageSize]byte
+	hitNum       float64
+	missNum      float64
+	hitRate      float64
+	maxSize      int        // 缓冲区的大小
+	writeIndex   int        // 写入位置的索引
+	readIndex    int        // 读取位置的索引
+	count        int        // 当前存储的元素数量
+	mutex        sync.Mutex // 写操作的互斥锁
+}
+
+// NewRingBuffer 创建一个指定大小的RingBuffer
+func NewRingBuffer(maxNum int) *RingBuffer {
+	return &RingBuffer{
+		cache_pkt:    make([][]byte, maxNum),
+		cache_nonce:  make([]uint64, maxNum),
+		cache_buffer: make([]*[65535]byte, maxNum),
+		hitNum:       0,
+		missNum:      0,
+		hitRate:      0,
+		maxSize:      maxNum,
+		readIndex:    0,
+		writeIndex:   0,
+		count:        0,
+		mutex:        sync.Mutex{},
+	}
+}
+
+// 读取一个
+func (rb *RingBuffer) Read() (pktRead []byte) {
+	if rb.IsEmpty() {
+		return nil
+	}
+	pktRead = rb.cache_pkt[rb.readIndex]
+	rb.readIndex = (rb.readIndex + 1) % rb.maxSize
+	rb.count--
+	return pktRead
+}
+
+// 读取第n个
+func (rb *RingBuffer) ReadN(n int) (pktRead []byte) {
+	if rb.IsEmpty() {
+		return nil
+	}
+	if n <= 0 {
+		return nil
+	}
+	if n > rb.count {
+		return nil
+	}
+	pktRead = rb.cache_pkt[(rb.readIndex+(n-1))%rb.maxSize]
+	rb.readIndex = (rb.readIndex + n) % rb.maxSize
+	rb.count -= n
+	return pktRead
+}
+
+// Write 向RingBuffer中写入一个元素，满时覆盖最早元素
+func (rb *RingBuffer) Write(pkt []byte, nonce uint64, buffer *[MaxMessageSize]byte) (bufferOverwrite *[MaxMessageSize]byte) {
+
+	if rb.IsFull() {
+		// 缓冲区已满，覆盖最早的元素
+		bufferOverwrite = rb.cache_buffer[rb.readIndex]
+		rb.readIndex = (rb.readIndex + 1) % rb.maxSize
+		// 写入新元素
+		rb.cache_pkt[rb.writeIndex] = pkt
+		rb.cache_nonce[rb.writeIndex] = nonce
+		rb.cache_buffer[rb.writeIndex] = buffer
+		rb.writeIndex = (rb.writeIndex + 1) % rb.maxSize
+		// 返回被覆盖的element
+		return bufferOverwrite
+
+	} else {
+		// 缓冲区未满，直接写入
+		rb.cache_pkt[rb.writeIndex] = pkt
+		rb.cache_nonce[rb.writeIndex] = nonce
+		rb.cache_buffer[rb.writeIndex] = buffer
+		rb.writeIndex = (rb.writeIndex + 1) % rb.maxSize
+		rb.count++
+	}
+	//rb.ShowAll()
+	//fmt.Println("WriteIndex:", rb.writeIndex, "- Counter:", p.nonce)
+	return nil
+}
+
+// IsFull 判断RingBuffer是否已满
+func (rb *RingBuffer) IsFull() bool {
+	return (rb.writeIndex+1)%rb.maxSize == rb.readIndex
+}
+
+// IsEmpty 判断RingBuffer是否为空
+func (rb *RingBuffer) IsEmpty() bool {
+	return rb.writeIndex == rb.readIndex
+}
+
+// Size 返回RingBuffer的大小
+func (rb *RingBuffer) MaxSize() int {
+	return rb.maxSize
+}
+
+// Count 返回当前RingBuffer中的元素数量
+func (rb *RingBuffer) Count() int {
+	return rb.count
+}
+
+// Iterate 遍历RingBuffer中的所有元素
+func (rb *RingBuffer) findLostPkt(rr_counter uint64) []byte {
+	// 如果缓冲区为空，直接返回
+	if rb.IsEmpty() {
+		return nil
+	}
+	//差值查找
+	delta := (int(rr_counter) - int(rb.cache_nonce[rb.readIndex]))
+	if delta < 0 {
+		return nil
+	} else {
+		idx := (rb.readIndex + delta) % rb.maxSize
+		if rb.cache_nonce[idx] == rr_counter {
+			return rb.ReadN(delta + 1)
+		}
+	}
+	return nil
 }

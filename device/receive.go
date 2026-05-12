@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -203,6 +202,36 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
+			case MessageRetransmissionRequestType:
+				// 处理重传数据包
+				if len(packet) != MessageRetransmissionRequestSize {
+					continue
+				} else {
+					/* TODO sender重传 */
+					rr_counter := binary.LittleEndian.Uint32(packet[8:16])
+					//device.log.Errorf("Received retransmission request - rr_counter := %v", rr_counter)
+					// lookup key pair
+					receiver := binary.LittleEndian.Uint32(
+						packet[MessageRetransmissionRequestOffsetReceiver:MessageRetransmissionRequestOffsetCounter],
+					)
+					// TODO 使用receiver去查表对吗？
+					value := device.indexTable.Lookup(receiver)
+					//device.log.Errorf(" *** MessageRetransmissionRequestType receiver: %v", value)
+					keypair := value.keypair
+					if keypair == nil {
+						continue
+					}
+					peer := value.peer
+					select {
+					case peer.rr_queue <- rr_counter:
+						// 把重传的请求放入peer中的队列
+					default:
+						// 如果队列满了，就丢弃
+					}
+
+					continue // 不能去执行后续select代码，因为那是把数据包放到handshake队列中
+				}
+
 			default:
 				device.log.Verbosef("Received message with unknown type")
 				continue
@@ -237,7 +266,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 }
 
 func (device *Device) RoutineDecryption(id int) {
-	var nonce [chacha20poly1305.NonceSize]byte
+	//var nonce [chacha20poly1305.NonceSize]byte
 
 	defer device.log.Verbosef("Routine: decryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: decryption worker %d - started", id)
@@ -249,19 +278,21 @@ func (device *Device) RoutineDecryption(id int) {
 			content := elem.packet[MessageTransportOffsetContent:]
 
 			// decrypt and release to consumer
-			var err error
+			//var err error
 			elem.counter = binary.LittleEndian.Uint64(counter)
+			// 跳过解密
 			// copy counter to nonce
-			binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
-			elem.packet, err = elem.keypair.receive.Open(
-				content[:0],
-				nonce[:],
-				content,
-				nil,
-			)
-			if err != nil {
-				elem.packet = nil
-			}
+			// binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
+			// elem.packet, err = elem.keypair.receive.Open(
+			// 	content[:0],
+			// 	nonce[:],
+			// 	content,
+			// 	nil,
+			// )
+			elem.packet = content
+			// if err != nil {
+			// 	elem.packet = nil
+			// }
 		}
 		elemsContainer.Unlock()
 	}
@@ -454,10 +485,20 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
-				continue
+			// if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
+			// 	continue
+			// }
+			/* SIGCOMM25: for satellite link retransmission*/
+			lost := elem.keypair.lostChecker.CheckerCounter(elem.counter)
+			for _, rr_counter := range lost {
+				// 避免阻塞
+				select {
+				case peer.rr_notification_queue <- rr_counter:
+					// 写成功
+				default:
+					// 写失败，可能丢弃、打日志、retry
+				}
 			}
-
 			validTailPacket = i
 			if peer.ReceivedWithKeypair(elem.keypair) {
 				peer.SetEndpointFromPacket(elem.endpoint)
@@ -536,5 +577,37 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		}
 		bufs = bufs[:0]
 		device.PutInboundElementsContainer(elemsContainer)
+	}
+}
+
+func (peer *Peer) RoutineSequentialNotifier(maxBatchSize int) {
+	device := peer.device
+	defer func() {
+		device.log.Verbosef("%v - Routine: sequential notifier - stopped", peer)
+		peer.stopping.Done()
+	}()
+	device.log.Verbosef("%v - Routine: sequential notifier - started", peer)
+
+	// 重新传输
+	for rr_counter := range peer.rr_notification_queue {
+		if rr_counter == 1 {
+			return
+		}
+		// 构造重传请求
+		var rr_msg MessageRetransmissionRequest
+		rr_msg.Type = MessageRetransmissionRequestType
+		rr_msg.Counter = rr_counter
+		rr_msg.Receiver = peer.handshake.remoteIndex // 指明对端的peer是谁
+		rr_msg.Padding = [48]byte{}
+		var buf [MessageRetransmissionRequestSize]byte
+		writer := bytes.NewBuffer(buf[:0])
+		binary.Write(writer, binary.LittleEndian, rr_msg)
+		pkt := writer.Bytes()
+		// 发送通知
+		err := peer.SendBuffers([][]byte{pkt})
+		//peer.device.log.Errorf("%v - 发送重传请求: %v", peer, rr_counter)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to send MessageRetransmissionRequest: %v", peer, err)
+		}
 	}
 }

@@ -60,3 +60,26 @@ func (f *Filter) ValidateCounter(counter, limit uint64) bool {
 	f.ring[indexBlock] = new
 	return old != new
 }
+
+type Checker struct {
+	last uint64
+}
+
+// 检查丢包
+func (c *Checker) CheckerCounter(counter uint64) []uint64 {
+	var lost []uint64
+	if counter > c.last+1 {
+		// 丢包
+		for i := c.last + 1; i < counter; i++ {
+			// 丢包处理
+			lost = append(lost, i)
+		}
+		c.last = counter
+	} else if counter < c.last+1 {
+		// 重传的包
+	} else {
+		// 没有丢包，顺序到达
+		c.last = counter
+	}
+	return lost
+}
